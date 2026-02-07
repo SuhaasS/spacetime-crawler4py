@@ -1,4 +1,7 @@
 import re
+import json
+import atexit
+from collections import Counter
 from urllib.parse import urlparse, urljoin, urldefrag
 
 from bs4 import BeautifulSoup
@@ -10,6 +13,75 @@ ALLOWED_DOMAINS = [
     ".informatics.uci.edu",
     ".stat.uci.edu",
 ]
+
+# from https://www.ranks.nl/stopwords (default english list)
+STOP_WORDS = {
+    "a","about","above","after","again","against","all","am","an","and","any",
+    "are","aren't","as","at","be","because","been","before","being","below",
+    "between","both","but","by","can't","cannot","could","couldn't","did",
+    "didn't","do","does","doesn't","doing","don't","down","during","each",
+    "few","for","from","further","had","hadn't","has","hasn't","have",
+    "haven't","having","he","he'd","he'll","he's","her","here","here's",
+    "hers","herself","him","himself","his","how","how's","i","i'd","i'll",
+    "i'm","i've","if","in","into","is","isn't","it","it's","its","itself",
+    "let's","me","more","most","mustn't","my","myself","no","nor","not","of",
+    "off","on","once","only","or","other","ought","our","ours","ourselves",
+    "out","over","own","same","shan't","she","she'd","she'll","she's",
+    "should","shouldn't","so","some","such","than","that","that's","the",
+    "their","theirs","them","themselves","then","there","there's","these",
+    "they","they'd","they'll","they're","they've","this","those","through",
+    "to","too","under","until","up","very","was","wasn't","we","we'd",
+    "we'll","we're","we've","were","weren't","what","what's","when","when's",
+    "where","where's","which","while","who","who's","whom","why","why's",
+    "with","won't","would","wouldn't","you","you'd","you'll","you're",
+    "you've","your","yours","yourself","yourselves",
+}
+
+# --- report data ---
+unique_pages = set()
+word_counts = Counter()
+longest_page = ("", 0)
+subdomains = Counter()
+
+
+def _save_report():
+    data = {
+        "unique_pages_count": len(unique_pages),
+        "longest_page": {"url": longest_page[0], "word_count": longest_page[1]},
+        "top_50_words": word_counts.most_common(50),
+        "subdomains": sorted(subdomains.items()),
+    }
+    with open("report.json", "w") as f:
+        json.dump(data, f, indent=2)
+
+atexit.register(_save_report)
+
+
+def _record_stats(url, soup):
+    global longest_page
+
+    # unique pages (defragmented url)
+    clean_url, _ = urldefrag(url)
+    unique_pages.add(clean_url)
+
+    # extract visible text
+    text = soup.get_text(separator=" ", strip=True)
+    words = re.findall(r"[a-z']+", text.lower())
+    words = [w for w in words if len(w) > 1 and w not in STOP_WORDS]
+
+    # longest page
+    if len(words) > longest_page[1]:
+        longest_page = (clean_url, len(words))
+
+    # word frequencies
+    word_counts.update(words)
+
+    # subdomains
+    parsed = urlparse(clean_url)
+    hostname = parsed.hostname
+    if hostname and hostname.endswith(".uci.edu"):
+        subdomains[hostname] += 1
+
 
 
 def scraper(url, resp):
@@ -31,6 +103,9 @@ def extract_next_links(url, resp):
 
     soup = BeautifulSoup(content, "html.parser")
     base_url = resp.raw_response.url if resp.raw_response.url else url
+
+    # record stats for report
+    _record_stats(base_url, soup)
 
     links = []
     for tag in soup.find_all("a", href=True):

@@ -1,6 +1,8 @@
 import re
 import json
+import sys
 import atexit
+import signal
 from collections import Counter, defaultdict
 from urllib.parse import urlparse, urljoin, urldefrag
 
@@ -90,6 +92,13 @@ def _save_report():
             f.write(f"{sub}, {len(subdomain_pages[sub])}\n")
 
 atexit.register(_save_report)
+
+def _handle_sigterm(signum, frame):
+    """Ensure report is saved when process is killed."""
+    _save_report()
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _handle_sigterm)
 
 
 def _tokenize(text):
@@ -293,6 +302,10 @@ def is_valid(url):
 
         bad_paths = ["/wp-json/", "/wp-content/uploads/"]
         if any(bp in path_lower for bp in bad_paths):
+            return False
+
+        # GitLab trap — thousands of repos each with issues/forks/starrers
+        if "gitlab" in (parsed.hostname or "").lower():
             return False
 
         # filter non-page file extensions

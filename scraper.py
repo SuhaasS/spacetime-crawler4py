@@ -150,7 +150,8 @@ def is_valid(url):
             + r"|epub|dll|cnf|tgz|sha1"
             + r"|thmx|mso|arff|rtf|jar|csv"
             + r"|rm|smil|wmv|swf|wma|zip|rar|gz"
-            + r"|img|sql|apk|ppsx|odc|war|db|lif)$",
+            + r"|img|sql|apk|ppsx|odc|war|db|lif"
+            + r"|c|cc|cpp|h|hpp|java|py|r|m|mat|o)$",
             path_lower,
         ):
             return False
@@ -159,6 +160,10 @@ def is_valid(url):
         if re.search(r"(calendar|date|event)", path_lower) and re.search(
             r"\d{4}[-/]\d{2}", parsed.path
         ):
+            return False
+
+        # avoid nested seminar-series trap
+        if path_lower.count("seminar-series") > 1:
             return False
 
         # avoid excessively long urls (likely traps)
@@ -170,6 +175,10 @@ def is_valid(url):
         if len(parts) > 10:
             return False
         if len(parts) != len(set(parts)):
+            return False
+
+        # avoid apache directory listing sort params
+        if re.search(r"[?&](C|O)=", parsed.query):
             return False
 
         # avoid common trap patterns

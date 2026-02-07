@@ -45,11 +45,10 @@ JUNK_WORDS = {
 }
 
 # --- report data ---
-unique_pages = set()
-word_counts = Counter()
+unique_pages: set[str] = set()
+word_counts: Counter[str] = Counter()
 longest_page = ("", 0)
-subdomain_pages = defaultdict(set)  # subdomain -> set of defragmented URLs
-
+subdomain_pages: defaultdict[str, set[str]] = defaultdict(set)  # subdomain -> set of defragmented URLs
 
 def _save_report():
     """Print report to terminal and write to files."""
@@ -276,6 +275,15 @@ def is_valid(url):
             return False
         if "oembed" in query_lower or "format=xml" in query_lower:
             return False
+        # DokuWiki media/action traps
+        if "do=media" in query_lower or "tab_files=" in query_lower \
+           or "tab_details=" in query_lower or "do=revisions" in query_lower \
+           or "do=backlink" in query_lower or "do=recent" in query_lower \
+           or "do=index" in query_lower:
+            return False
+        # filter=[] pagination traps on news/listing pages
+        if "filter%5b" in query_lower or "filter[" in query_lower:
+            return False
 
         # --- path-based filters ---
         if path_lower.endswith("/feed") or "/feed/" in path_lower:
@@ -326,8 +334,9 @@ def is_valid(url):
         if len(parts) != len(set(parts)):
             return False
 
-        # Apache directory listing sort params
-        if re.search(r"[?&](C|O)=", parsed.query):
+        # Apache directory listing sort params (uses ; separator, and
+        # parsed.query doesn't include the leading ?)
+        if re.search(r"(^|[&;])(C|O)=", parsed.query):
             return False
 
         # login / admin pages

@@ -280,35 +280,65 @@ def is_valid(url):
         query_lower = (parsed.query or "").lower()
 
         # --- query-string traps ---
+
+        # wordpress comment reply links (?replytocom=) and social share links
+        # (?share=) generate infinite unique urls that all point to the same
+        # page content, creating a crawler trap
         if "replytocom=" in query_lower or "share=" in query_lower:
             return False
+
+        # oembed endpoints and xml format params return machine-readable
+        # metadata (json/xml) instead of crawlable html pages
         if "oembed" in query_lower or "format=xml" in query_lower:
             return False
-        # DokuWiki media/action traps
+
+        # dokuwiki (e.g. intranet.ics.uci.edu/doku.php) generates combinatorial
+        # urls from action params like do=media, do=revisions, do=backlink,
+        # do=recent, do=index, and tab params (tab_files, tab_details). each
+        # combination creates a unique url with no new content, producing
+        # thousands of trap urls from a single wiki page
         if "do=media" in query_lower or "tab_files=" in query_lower \
            or "tab_details=" in query_lower or "do=revisions" in query_lower \
            or "do=backlink" in query_lower or "do=recent" in query_lower \
            or "do=index" in query_lower:
             return False
-        # filter=[] pagination traps on news/listing pages
+
+        # wordpress news/listing pages use filter[] query params for faceted
+        # filtering (e.g. ?filter[category]=x&filter[tag]=y). the brackets
+        # get url-encoded as %5b/%5d, and each combination creates a new url
+        # pointing to the same or near-identical filtered listing
         if "filter%5b" in query_lower or "filter[" in query_lower:
             return False
 
         # --- path-based filters ---
+
+        # rss/atom feed endpoints return xml syndication data, not html pages.
+        # wordpress sites expose /feed and /feed/ on every post and category
         if path_lower.endswith("/feed") or "/feed/" in path_lower:
             return False
+
+        # xml files (sitemaps, rss feeds, config files) are not crawlable
+        # html content
         if path_lower.endswith(".xml"):
             return False
 
+        # /wp-json/ is the wordpress rest api — returns json, not html pages.
+        # /wp-content/uploads/ links directly to uploaded media files (pdfs,
+        # images, docs) which have no links to extract
         bad_paths = ["/wp-json/", "/wp-content/uploads/"]
         if any(bp in path_lower for bp in bad_paths):
             return False
 
-        # GitLab trap — thousands of repos each with issues/forks/starrers
+        # gitlab.ics.uci.edu hosts thousands of git repos, each with
+        # sub-pages for issues, merge requests, forks, starrers, branches,
+        # commits, etc. this creates an enormous trap of tens of thousands
+        # of urls with mostly boilerplate ui content and no useful text
         if "gitlab" in (parsed.hostname or "").lower():
             return False
 
-        # filter non-page file extensions
+        # skip non-html file extensions — binary files, media, archives,
+        # documents, and source code files contain no extractable links
+        # and would waste crawl budget
         if re.match(
             r".*\.(css|js|bmp|gif|jpe?g|ico"
             + r"|png|tiff?|mid|mp2|mp3|mp4"
@@ -326,33 +356,46 @@ def is_valid(url):
 
         # --- trap detection ---
 
-        # calendar traps
+        # calendar/event pages with date patterns (e.g. /calendar/2023-01/)
+        # generate infinite urls — one for every possible date combination.
+        # if the path contains calendar/date/event keywords AND a yyyy-mm
+        # date pattern, it's almost certainly a calendar trap
         if re.search(r"(calendar|date|event)", path_lower) and re.search(
             r"\d{4}[-/]\d{2}", parsed.path
         ):
             return False
 
-        # nested seminar-series trap
+        # some sites nest the same path segment recursively
+        # (e.g. /seminar-series/seminar-series/...) creating infinite depth.
+        # if "seminar-series" appears more than once in the path, it's a loop
         if path_lower.count("seminar-series") > 1:
             return False
 
-        # excessively long URLs
+        # extremely long urls are almost always dynamically generated trap
+        # urls or deeply nested paths — real content pages rarely exceed
+        # 200 characters
         if len(url) > 200:
             return False
 
-        # repeated directory segments
+        # repeated directory segments (e.g. /a/b/a/b/...) indicate a path
+        # loop trap. also cap total depth at 10 segments since legitimate
+        # site structures rarely go that deep
         parts = [p for p in parsed.path.split("/") if p]
         if len(parts) > 10:
             return False
         if len(parts) != len(set(parts)):
             return False
 
-        # Apache directory listing sort params (uses ; separator, and
-        # parsed.query doesn't include the leading ?)
+        # apache directory listings add sort params like ?C=N;O=A (column
+        # and order). each sort combination creates a unique url for the
+        # same directory listing. uses ; as separator instead of &, and
+        # parsed.query doesn't include the leading ? so we match from ^
         if re.search(r"(^|[&;])(C|O)=", parsed.query):
             return False
 
-        # login / admin pages
+        # login, logout, and admin pages (wp-admin, wp-login) require
+        # authentication and often redirect in loops. action= params
+        # trigger server-side actions rather than serving content
         if re.search(r"(login|logout|wp-admin|wp-login|action=)", url.lower()):
             return False
 

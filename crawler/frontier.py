@@ -19,6 +19,7 @@ class Frontier(object):
         # Organize URLs by domain for per-domain politeness
         self.domain_queues = defaultdict(deque)  # domain -> deque of URLs
         self.last_accessed = {}  # domain -> timestamp of last download
+        self.active_downloads = 0  # URLs handed out but not yet completed
 
         if not os.path.exists(self.config.save_file) and not restart:
             # Save file does not exist, but request to load save.
@@ -83,6 +84,7 @@ class Frontier(object):
                     # This domain is ready, get a URL from it
                     url = queue.popleft()
                     self.last_accessed[domain] = current_time
+                    self.active_downloads += 1
                     return url
 
             # No domain is ready yet
@@ -115,8 +117,12 @@ class Frontier(object):
 
             self.save[urlhash] = (url, True)
             self.save.sync()
+            self.active_downloads -= 1
 
     def has_pending_urls(self):
-        """Check if there are any URLs waiting to be downloaded (thread-safe)."""
+        """Check if there are queued URLs or in-flight downloads (thread-safe)."""
         with self.lock:
-            return any(len(queue) > 0 for queue in self.domain_queues.values())
+            if any(len(queue) > 0 for queue in self.domain_queues.values()):
+                return True
+            # Other threads may still be downloading and could add new URLs
+            return self.active_downloads > 0

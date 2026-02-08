@@ -18,11 +18,27 @@ class Worker(Thread):
         super().__init__(daemon=True)
         
     def run(self):
+        """
+        Main worker loop with per-domain politeness enforcement.
+        The frontier handles the 500ms delay between requests to the same domain.
+        """
         while True:
             tbd_url = self.frontier.get_tbd_url()
+
             if not tbd_url:
-                self.logger.info("Frontier is empty. Stopping Crawler.")
-                break
+                # No URL available right now - could be due to politeness delay
+                # Check if there are any pending URLs at all
+                if self.frontier.has_pending_urls():
+                    # URLs exist but are waiting for politeness delay
+                    # Sleep briefly and retry
+                    time.sleep(0.1)
+                    continue
+                else:
+                    # No URLs left at all - stop crawling
+                    self.logger.info("Frontier is empty. Stopping Crawler.")
+                    break
+
+            # Download and process the URL
             resp = download(tbd_url, self.config, self.logger)
             self.logger.info(
                 f"Downloaded {tbd_url}, status <{resp.status}>, "
@@ -31,4 +47,6 @@ class Worker(Thread):
             for scraped_url in scraped_urls:
                 self.frontier.add_url(scraped_url)
             self.frontier.mark_url_complete(tbd_url)
-            time.sleep(self.config.time_delay)
+
+            # Note: We don't sleep here anymore because the frontier
+            # handles politeness delay by tracking last access per domain

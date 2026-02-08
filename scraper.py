@@ -3,6 +3,8 @@ import json
 import sys
 import atexit
 import signal
+from datetime import datetime
+from threading import Lock
 from collections import Counter, defaultdict
 from urllib.parse import urlparse, urljoin, urldefrag
 
@@ -52,44 +54,78 @@ word_counts: Counter[str] = Counter()
 longest_page = ("", 0)
 subdomain_pages: defaultdict[str, set[str]] = defaultdict(set)  # subdomain -> set of defragmented URLs
 
+# Thread safety locks
+stats_lock = Lock()  # Protects unique_pages, word_counts, longest_page, subdomain_pages
+log_lock = Lock()    # Protects log file writes
+
+# Initialize crawl log file
+CRAWL_LOG_FILE = "crawl_log.txt"
+try:
+    with open(CRAWL_LOG_FILE, "w", encoding="utf-8") as f:
+        f.write(f"Crawl started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 80 + "\n\n")
+except Exception:
+    pass
+
+def _log_crawl(url, word_count, subdomain):
+    """Append crawl event to log file (thread-safe)."""
+    try:
+        with log_lock:
+            with open(CRAWL_LOG_FILE, "a", encoding="utf-8") as f:
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                # Read unique_pages count with stats_lock
+                with stats_lock:
+                    page_count = len(unique_pages)
+                f.write(f"[{timestamp}] Pages: {page_count} | Words: {word_count} | {subdomain}\n")
+                f.write(f"  {url}\n\n")
+    except Exception:
+        pass
+
 def _save_report():
-    """Print report to terminal and write to files."""
+    """Print report to terminal and write to files (thread-safe)."""
+    # Acquire lock to read all statistics atomically
+    with stats_lock:
+        unique_count = len(unique_pages)
+        longest_url, longest_count = longest_page
+        top_words = word_counts.most_common(50)
+        subdomain_counts = {sub: len(urls) for sub, urls in subdomain_pages.items()}
+
     print("\n" + "=" * 50)
     print("FINAL CRAWL ANALYTICS")
     print("=" * 50)
-    print(f"Unique pages: {len(unique_pages)}")
-    print(f"Longest page: {longest_page[0]}")
-    print(f"Longest page word count: {longest_page[1]}")
+    print(f"Unique pages: {unique_count}")
+    print(f"Longest page: {longest_url}")
+    print(f"Longest page word count: {longest_count}")
 
     print("\nTop 50 words (stopwords removed):")
-    for w, c in word_counts.most_common(50):
+    for w, c in top_words:
         print(f"  {w}\t{c}")
 
-    print(f"\nSubdomains ({len(subdomain_pages)} total, alphabetical):")
-    for sub in sorted(subdomain_pages.keys()):
-        print(f"  {sub}, {len(subdomain_pages[sub])}")
+    print(f"\nSubdomains ({len(subdomain_counts)} total, alphabetical):")
+    for sub in sorted(subdomain_counts.keys()):
+        print(f"  {sub}, {subdomain_counts[sub]}")
 
     # Write structured JSON
     data = {
-        "unique_pages_count": len(unique_pages),
-        "longest_page": {"url": longest_page[0], "word_count": longest_page[1]},
-        "top_50_words": word_counts.most_common(50),
-        "subdomains": {sub: len(urls) for sub, urls in sorted(subdomain_pages.items())},
+        "unique_pages_count": unique_count,
+        "longest_page": {"url": longest_url, "word_count": longest_count},
+        "top_50_words": top_words,
+        "subdomains": {sub: count for sub, count in sorted(subdomain_counts.items())},
     }
     with open("report.json", "w") as f:
         json.dump(data, f, indent=2)
 
     # Write human-readable report
     with open("final_report_stats.txt", "w", encoding="utf-8") as f:
-        f.write(f"Unique pages: {len(unique_pages)}\n")
-        f.write(f"Longest page: {longest_page[0]}\n")
-        f.write(f"Longest page word count: {longest_page[1]}\n\n")
+        f.write(f"Unique pages: {unique_count}\n")
+        f.write(f"Longest page: {longest_url}\n")
+        f.write(f"Longest page word count: {longest_count}\n\n")
         f.write("Top 50 words (stopwords removed):\n")
-        for w, c in word_counts.most_common(50):
+        for w, c in top_words:
             f.write(f"{w}\t{c}\n")
         f.write(f"\nSubdomains (alphabetical) with unique page counts:\n")
-        for sub in sorted(subdomain_pages.keys()):
-            f.write(f"{sub}, {len(subdomain_pages[sub])}\n")
+        for sub in sorted(subdomain_counts.keys()):
+            f.write(f"{sub}, {subdomain_counts[sub]}\n")
 
 atexit.register(_save_report)
 
@@ -175,7 +211,7 @@ def _extract_visible_text(soup):
 
 
 def _record_stats(url, soup):
-    """Collect analytics: unique pages, word freq, longest page, subdomains."""
+    """Collect analytics: unique pages, word freq, longest page, subdomains (thread-safe)."""
     global longest_page
 
     clean_url, _ = urldefrag(url)
@@ -188,19 +224,9 @@ def _record_stats(url, soup):
     if len(tokens) < 50:
         return
 
-    # Track unique pages
-    unique_pages.add(clean_url)
-
-    # Track subdomains (unique URLs per subdomain)
+    # Parse hostname
     parsed = urlparse(clean_url)
     hostname = (parsed.hostname or "").lower()
-    if hostname.endswith(".uci.edu") or hostname == "uci.edu":
-        subdomain_pages[hostname].add(clean_url)
-
-    # Longest page by word count
-    wc = len(tokens)
-    if wc > longest_page[1]:
-        longest_page = (clean_url, wc)
 
     # Filter tokens, then compute frequencies using PartA logic
     filtered = [t for t in tokens
@@ -208,11 +234,28 @@ def _record_stats(url, soup):
                 and t not in STOP_WORDS
                 and t not in JUNK_WORDS]
     page_freqs = _compute_word_frequencies(filtered)
+    wc = len(tokens)
 
-    # Cap per-page contribution to avoid single-page skew
-    PER_PAGE_CAP = 10
-    for w, c in page_freqs.items():
-        word_counts[w] += min(c, PER_PAGE_CAP)
+    # Update global statistics with lock
+    with stats_lock:
+        # Track unique pages
+        unique_pages.add(clean_url)
+
+        # Track subdomains (unique URLs per subdomain)
+        if hostname.endswith(".uci.edu") or hostname == "uci.edu":
+            subdomain_pages[hostname].add(clean_url)
+
+        # Longest page by word count
+        if wc > longest_page[1]:
+            longest_page = (clean_url, wc)
+
+        # Cap per-page contribution to avoid single-page skew
+        PER_PAGE_CAP = 10
+        for w, c in page_freqs.items():
+            word_counts[w] += min(c, PER_PAGE_CAP)
+
+    # Log this crawl event
+    _log_crawl(clean_url, wc, hostname)
 
 
 def scraper(url, resp):

@@ -72,10 +72,14 @@ unique_pages: set[str] = set()
 word_counts: Counter[str] = Counter()
 longest_page = ("", 0)  # (url, word_count)
 subdomain_pages: defaultdict[str, set[str]] = defaultdict(set)
+pages_processed = 0  # Counter for periodic saves
 
 # Thread synchronization locks
 stats_lock = Lock()  # Protects all analytics data structures
 log_lock = Lock()    # Protects log file writes
+
+# Crash recovery: save report every N pages
+SAVE_INTERVAL = 50  # Periodic save frequency (balances I/O vs. data loss)
 
 # Initialize crawl activity log
 CRAWL_LOG_FILE = "crawl_log.txt"
@@ -110,14 +114,18 @@ def _log_crawl(url, word_count, subdomain):
     except Exception:
         pass
 
-def _save_report():
+def _save_report(final=False):
     """
-    Generate and save final crawl analytics report (thread-safe).
+    Generate and save crawl analytics report (thread-safe, fault-tolerant).
+
+    Called periodically during crawl and at exit for crash recovery.
+
+    Args:
+        final: If True, print to console (only on final save)
 
     Outputs:
-        - report.json: Machine-readable JSON format
+        - report.json: Machine-readable JSON with top 50 words
         - final_report_stats.txt: Human-readable text format
-        - Console output: Summary to terminal
 
     Report includes:
         - Total unique pages crawled
@@ -125,63 +133,93 @@ def _save_report():
         - Top 50 most common words (excluding stopwords)
         - Subdomain distribution
     """
-    # Atomically read all statistics
-    with stats_lock:
-        unique_count = len(unique_pages)
-        longest_url, longest_count = longest_page
-        top_words = word_counts.most_common(50)
-        subdomain_counts = {sub: len(urls) for sub, urls in subdomain_pages.items()}
+    try:
+        # Atomically read all statistics
+        with stats_lock:
+            unique_count = len(unique_pages)
+            longest_url, longest_count = longest_page
+            top_words = word_counts.most_common(50)
+            subdomain_counts = {sub: len(urls) for sub, urls in subdomain_pages.items()}
 
-    # Print to console
-    print("\n" + "=" * 50)
-    print("FINAL CRAWL ANALYTICS")
-    print("=" * 50)
-    print(f"Unique pages: {unique_count}")
-    print(f"Longest page: {longest_url}")
-    print(f"Longest page word count: {longest_count}")
+        # Print to console only on final save
+        if final:
+            print("\n" + "=" * 50)
+            print("FINAL CRAWL ANALYTICS")
+            print("=" * 50)
+            print(f"Unique pages: {unique_count}")
+            print(f"Longest page: {longest_url}")
+            print(f"Longest page word count: {longest_count}")
 
-    print("\nTop 50 words (stopwords removed):")
-    for word, count in top_words:
-        print(f"  {word}\t{count}")
+            print("\nTop 50 words (stopwords removed):")
+            for word, count in top_words:
+                print(f"  {word}\t{count}")
 
-    print(f"\nSubdomains ({len(subdomain_counts)} total, alphabetical):")
-    for subdomain in sorted(subdomain_counts.keys()):
-        print(f"  {subdomain}, {subdomain_counts[subdomain]}")
+            print(f"\nSubdomains ({len(subdomain_counts)} total, alphabetical):")
+            for subdomain in sorted(subdomain_counts.keys()):
+                print(f"  {subdomain}, {subdomain_counts[subdomain]}")
 
-    # Write structured JSON for programmatic access
-    data = {
-        "unique_pages_count": unique_count,
-        "longest_page": {"url": longest_url, "word_count": longest_count},
-        "top_50_words": top_words,
-        "subdomains": {sub: count for sub, count in sorted(subdomain_counts.items())},
-    }
-    with open("report.json", "w") as f:
-        json.dump(data, f, indent=2)
+        # Write structured JSON for programmatic access (crash recovery)
+        try:
+            data = {
+                "unique_pages_count": unique_count,
+                "longest_page": {"url": longest_url, "word_count": longest_count},
+                "top_50_words": top_words,
+                "subdomains": {sub: count for sub, count in sorted(subdomain_counts.items())},
+            }
+            with open("report.json", "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Failed to write report.json: {e}")
 
-    # Write human-readable text report
-    with open("final_report_stats.txt", "w", encoding="utf-8") as f:
-        f.write(f"Unique pages: {unique_count}\n")
-        f.write(f"Longest page: {longest_url}\n")
-        f.write(f"Longest page word count: {longest_count}\n\n")
-        f.write("Top 50 words (stopwords removed):\n")
-        for word, count in top_words:
-            f.write(f"{word}\t{count}\n")
-        f.write(f"\nSubdomains (alphabetical) with unique page counts:\n")
-        for subdomain in sorted(subdomain_counts.keys()):
-            f.write(f"{subdomain}, {subdomain_counts[subdomain]}\n")
+        # Write human-readable text report
+        try:
+            with open("final_report_stats.txt", "w", encoding="utf-8") as f:
+                f.write(f"Unique pages: {unique_count}\n")
+                f.write(f"Longest page: {longest_url}\n")
+                f.write(f"Longest page word count: {longest_count}\n\n")
+                f.write("Top 50 words (stopwords removed):\n")
+                for word, count in top_words:
+                    f.write(f"{word}\t{count}\n")
+                f.write(f"\nSubdomains (alphabetical) with unique page counts:\n")
+                for subdomain in sorted(subdomain_counts.keys()):
+                    f.write(f"{subdomain}, {subdomain_counts[subdomain]}\n")
+        except Exception as e:
+            print(f"Warning: Failed to write final_report_stats.txt: {e}")
+
+    except Exception as e:
+        print(f"Error in _save_report: {e}")
 
 
-# Register cleanup handlers to ensure report is saved on exit
-atexit.register(_save_report)
+def _save_report_final():
+    """Wrapper for final save (prints to console)."""
+    _save_report(final=True)
 
 
-def _handle_sigterm(signum, frame):
-    """Signal handler to save report when process is terminated."""
-    _save_report()
+# Register cleanup handlers to ensure report is saved on exit/crash
+atexit.register(_save_report_final)
+
+
+def _handle_signal(signum, frame):
+    """
+    Signal handler for graceful shutdown.
+
+    Saves report and exits when receiving termination signals.
+    Handles: SIGTERM (kill), SIGINT (Ctrl+C), SIGHUP (terminal close)
+
+    Note: SIGKILL (kill -9) cannot be caught, hence periodic saves
+    """
+    print(f"\nReceived signal {signum}, saving report and exiting...")
+    _save_report(final=True)
     sys.exit(0)
 
 
-signal.signal(signal.SIGTERM, _handle_sigterm)
+# Register signal handlers for common termination signals
+signal.signal(signal.SIGTERM, _handle_signal)  # kill command
+signal.signal(signal.SIGINT, _handle_signal)   # Ctrl+C
+try:
+    signal.signal(signal.SIGHUP, _handle_signal)   # Terminal closed
+except AttributeError:
+    pass  # SIGHUP not available on Windows
 
 # ============================================================================
 # TEXT PROCESSING
@@ -306,8 +344,12 @@ def _record_stats(url, soup):
         - Removes words < 2 or > 30 characters
         - Excludes stopwords and HTML artifacts
         - Caps per-page word contribution at 10 to prevent skew
+
+    Crash Recovery:
+        - Periodically saves report.json every SAVE_INTERVAL pages
+        - Ensures data survives OOM or unexpected termination
     """
-    global longest_page
+    global longest_page, pages_processed
 
     clean_url, _ = urldefrag(url)
 
@@ -334,6 +376,7 @@ def _record_stats(url, soup):
     total_word_count = len(tokens)
 
     # Update global statistics atomically
+    should_save = False
     with stats_lock:
         unique_pages.add(clean_url)
 
@@ -350,8 +393,17 @@ def _record_stats(url, soup):
         for word, count in page_freqs.items():
             word_counts[word] += min(count, PER_PAGE_CAP)
 
+        # Periodic save check (crash recovery)
+        pages_processed += 1
+        if pages_processed % SAVE_INTERVAL == 0:
+            should_save = True
+
     # Log the crawl activity
     _log_crawl(clean_url, total_word_count, hostname)
+
+    # Periodic report save (outside lock to avoid blocking)
+    if should_save:
+        _save_report(final=False)
 
 # ============================================================================
 # MAIN SCRAPER INTERFACE
